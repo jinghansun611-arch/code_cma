@@ -1,0 +1,260 @@
+clear
+clear global
+clc
+% ============================================================
+%   CMA-ES 精修主入口（在你粗搜主函数基础上，仅修改前面部分）
+%   - 从 Stage-1 的 best_stage1.mat 读取 BEST_X_G 作为 x0
+%   - sigma0 变小、GA.N 可变小做局部精修
+%   - Abaqus 工作目录改为 A-CMAES-<ORDER>-refine（避免覆盖粗搜目录）
+% ============================================================
+
+%% ------------------------------ 参数设定区 ------------------------------
+global GA FEA tar T Phe
+
+% ========== 0) 【精修建议参数】你只需要在这里改 ==========
+GA.T_MAX  = 30;          % 精修迭代数（建议 20~40）
+GA.N      = 8;           % 精修每代个体数（建议 6~10；你机器也可 10~12）
+GA.TYPE   = 4;
+GA.D      = [11,11,1,1];
+GA.EXPECT = 0.01;        % 精修期望误差
+GA.BIT    = 10000;
+
+GA.CMA.sigma0 = 0.1;    % ★精修核心：步长要小（0.05~0.10）
+GA.CMA.x0     = [];      % 稍后会从 stage1 的 best_stage1.mat 读入覆盖
+GA.CMA.elite_inject = true;
+
+% --- 仿真计算参数（完全照搬你的粗搜） ---
+FEA.multitask = 4;              % 同时运行 Job 个数
+FEA.cpus      = 3;              % 每个 Job 使用的 CPU 核数
+FEA.load_disturb   = 5e-7;
+FEA.load_pressall  = 5e-8;
+FEA.load_pressbond = 5e-8;
+FEA.mesh =[0.5;0.5];
+FEA.t = 0.05;
+FEA.step_stabilize = [1e-6;1e-6;1e-6;1e-6;1e-6];
+FEA.step_time = [5;1;1;1;5];
+
+FEA.N = GA.N;                   % ★注意：精修 GA.N 改了，这里也要同步
+FEA.penalty_1 = 1;
+
+%% ------------------------------ 目标构型设置 ------------------------------
+A_set_tar_equation;
+Fun_cal_para_tar_eqation;
+
+%% ------------------------------ CMA-ES 初始化 ------------------------------
+% 建立 x ↔ PP 的映射（自动识别 judge/symmetry/lambda 全局变量）
+map = Fun_CMAES_build_map();
+
+% ========== 1) 【精修新增】从 Stage-1 读取 best_stage1.mat，设定 x0 ==========
+% 你给的真实例子：
+%   D:\CMAES_inverse_design_pack\code_cma\A-CMAES-2S\best_stage1.mat
+%
+% 这里我用"自动定位"的方式：假设你从 GA-Cylinder-1 运行脚本
+% 那么 root_dir = GA-Cylinder-1 的上一级（也就是 code_cma）
+% stage1_dir = root_dir\A-CMAES-<GA.ORDER>
+
+path_GA = pwd;                % 你当前运行目录（通常是 ...\code_cma\GA-Cylinder-1）
+root_dir = fileparts(path_GA);% 上一级目录（... \code_cma）
+
+stage1_dir = fullfile(root_dir, ['A-CMAES-2S-refine 0.0417']);  % e.g. ...\A-CMAES-2S
+bestfile_stage1 = fullfile(stage1_dir, 'best_stage1.mat');
+
+if ~exist(bestfile_stage1, 'file')
+    error(['找不到 Stage-1 best_stage1.mat：\n  %s\n' ...
+           '请确认：1) 你确实先跑过粗搜；2) GA.ORDER 对应的文件夹存在；3) 路径无误。'], bestfile_stage1);
+end
+
+S = load(bestfile_stage1, 'BEST_X_G','BEST_D_G','BEST_NUM','BEST_P_G');
+if ~isfield(S,'BEST_X_G') || isempty(S.BEST_X_G)
+    error('Stage-1 的 best_stage1.mat 里没有 BEST_X_G，无法精修。');
+end
+
+x0_from_stage1 = S.BEST_X_G(:);
+
+% 维度检查：必须与当前 map.nvars 一致（否则说明你改了 symmetry/JUDGE/range）
+if numel(x0_from_stage1) ~= map.nvars
+    error(['x0 维度不匹配：Stage-1 BEST_X_G 是 %d 维，但当前 map.nvars=%d。\n' ...
+           '说明你精修时的 set_equation/symmetry/JUDGE/range 与粗搜不一致。'], ...
+           numel(x0_from_stage1), map.nvars);
+end
+
+GA.CMA.x0 = x0_from_stage1;
+
+fprintf('【精修】已读取 Stage-1 最优：DEL=%g (T=%d, Phe=%d)\n', ...
+        S.BEST_D_G, S.BEST_NUM(1), S.BEST_NUM(2));
+fprintf('【精修】x0 维度 = %d, sigma0 = %g, N = %d\n', map.nvars, GA.CMA.sigma0, GA.N);
+
+% ========== 2) 初始化 CMA-ES 状态（用 x0 覆盖默认 0.5） ==========
+x0 = GA.CMA.x0;
+sigma0 = GA.CMA.sigma0;
+
+cma = Fun_CMAES_init(map.nvars, GA.N, x0, sigma0);
+cma.elite_inject = GA.CMA.elite_inject;
+
+% （可选但推荐）把 Stage-1 的历史最优写进 cma，便于 elite_inject 在第1代就注入
+cma.xbest = x0;
+if isfield(S,'BEST_D_G') && ~isempty(S.BEST_D_G)
+    cma.fbest = S.BEST_D_G;
+end
+
+%% ------------------------------ 个体库/历史量 ------------------------------
+P = cell(GA.N, GA.TYPE, GA.T_MAX);
+
+BEST_NUM = zeros(1,2);   % [T, Phe]
+BEST_P_G = P(1,:,1);
+BEST_D_G = inf;
+BEST_X_G = [];           % 对应的自由变量 x（0~1, nvars×1）
+
+HIS_D_P  = zeros(GA.T_MAX, GA.N);
+HIS_D_G  = zeros(GA.T_MAX, 1);
+HIS_D_TP = zeros(GA.T_MAX, 2);
+
+% 先 ask 一代，填充 P(:,:,1)
+[X, cma] = Fun_CMAES_ask(cma);
+for pn = 1:GA.N
+    P(pn,:,1) = Fun_CMAES_vec2PP(X(pn,:), map);
+end
+
+T = 1; Phe = 1;
+
+%% ------------------------------ 存储设定（保持你原工程逻辑，仅改输出文件夹名） ------------------------------
+ORDER = GA.ORDER;
+Structure = GA.Structure;
+name_data = ['mat-CMAES-', ORDER, Structure, '.mat'];
+
+name_oldfile = 'A-GA-';
+
+% ========== 3) 【精修新增】避免覆盖粗搜目录：输出到 A-CMAES-<ORDER>-refine ==========
+name_newfile = ['A-CMAES-', ORDER, '-refine'];
+
+path_matlab = cd('..');                  % 进入 root_dir（code_cma）
+% 如果 refine 目录已存在：建议删掉重建，避免旧的 odb/txt 干扰
+if exist(name_newfile,'dir')
+    rmdir(name_newfile,'s');
+end
+copyfile(name_oldfile, name_newfile);    % 复制模板目录
+cd(['.\', name_newfile]);                % 进入 refine 工作目录
+path_abaqus = cd(path_matlab);           % 返回 root_dir，同时拿到 refine 目录绝对路径
+
+fprintf('------------CMA-ES 精修开始-----------\n');
+fprintf('Stage1 bestfile: %s\n', bestfile_stage1);
+fprintf('Refine workdir : %s\n', path_abaqus);
+time_all = tic;
+fprintf('初始化完成:');
+toc(time_all)
+
+%% =============================== 主循环 ===============================
+for T = 1:GA.T_MAX
+    if T <= 5 %前 5 代关掉，让算法自由探索
+    cma.elite_inject = false;
+    else
+        cma.elite_inject = true;
+    end
+
+    fprintf('------------第%d代迭代开始\n', T);
+    time_T = tic;
+    FEA.NUM_T = T;
+
+    % 先把对称/全局规则应用到本代 P（保证送进 Abaqus 的都是可行解）
+    P(:,:,T) = Fun_set_special(P(:,:,T));
+
+    % 用于 CMA-ES 更新的"可行域 x"（在 Fun_set_special 之后再抽取）
+    X_feasible = zeros(GA.N, map.nvars);
+    for pn = 1:GA.N
+        X_feasible(pn,:) = Fun_CMAES_PP2vec(P(pn,:,T), map)';
+    end
+    X_T = X_feasible;   % 备份本代用于评估的 X（用于记录BEST_X_G）
+
+    %% -------- 1) 生成每个个体的 mat（sketch/bc 等） --------
+    time_part = tic;
+    for Phe = 1:GA.N
+        name_cae_mat = ['mat-', num2str(T), '-', num2str(Phe), '.mat'];
+        sketch = Fun_cal_para_2D(P(Phe,:,T));
+        cd(path_abaqus);
+        save(name_cae_mat);
+        cd(path_matlab);
+    end
+    fprintf('[%d]草图参数计算完成 ：', Phe);
+    toc(time_part)
+
+    %% -------- 2) Abaqus 批量计算 --------
+    abaqus_run(path_abaqus);
+
+    %% -------- 3) 读取 odb + 计算误差 del --------
+    fprintf('----------第%d代ODB处理开始----------\n', T);
+    time_part = tic;
+
+    for Phe = 1:GA.N
+        result = abaqus_odb_m(path_abaqus);
+        if isempty(result.rx{1}) == 0
+            result = Fun_cal_para_odb_m(result);
+            del = cal_delta_C_m(result);
+        else
+            del = 1; % 失败个体直接给一个较差的目标值
+        end
+
+        HIS_D_P(T, Phe) = del;
+
+        if del < BEST_D_G
+            BEST_D_G = del;
+            BEST_P_G = P(Phe,:,T);
+            BEST_X_G = X_T(Phe,:).';   % 保存自由变量最优（nvars×1）
+            BEST_NUM = [T, Phe];
+        end
+    end
+
+    HIS_D_G(T) = BEST_D_G;
+    HIS_D_TP(T,:) = BEST_NUM;
+
+    fprintf('----------第%d代ODB处理结束：', T);
+    toc(time_part)
+
+    fprintf('当前最佳误差 ：%g    ', BEST_D_G);
+    fprintf('最佳个体信息 ： JOB-%d-%d \n', BEST_NUM(1), BEST_NUM(2));
+
+    % -------- 4) 提前停止 --------
+    if BEST_D_G < GA.EXPECT
+        fprintf('CMA-ES complete! T=%d. Best DEL=%g\n', T, BEST_D_G);
+        break;
+    end
+
+    % -------- 5) CMA-ES 更新并 ask 下一代 --------
+    if T < GA.T_MAX
+        cma = Fun_CMAES_tell(cma, X_feasible, HIS_D_P(T,:)');
+        [X, cma] = Fun_CMAES_ask(cma);
+        for pn = 1:GA.N
+            P(pn,:,T+1) = Fun_CMAES_vec2PP(X(pn,:), map);
+        end
+    end
+
+    fprintf('本代');
+    toc(time_T)
+    fprintf('总运行时间：');
+    toc(time_all)
+    fprintf('-----------------------------第%d代结束-----------------------------\n', T);
+end
+
+T_NOW = T;
+% -------- 保存最优解，供下一阶段读取（存到 refine 目录） --------
+bestfile = fullfile(path_abaqus, 'best_stage1.mat');  % 仍叫 best_stage1.mat，但在 refine 文件夹里
+save(bestfile, 'BEST_P_G','BEST_X_G','BEST_D_G','BEST_NUM','GA','tar','map','-v7.3');
+fprintf('Saved best to: %s (DEL=%g at T=%d, Phe=%d)\n', bestfile, BEST_D_G, BEST_NUM(1), BEST_NUM(2));
+
+%% ------------------------------ 保存/绘图（保持你原工程输出） ------------------------------
+save_sketch = Fun_cal_para_2D(P(BEST_NUM(2),:,BEST_NUM(1)));
+T = BEST_NUM(1);
+Phe = BEST_NUM(2);
+save_result = abaqus_odb_m(path_abaqus);
+save_result = Fun_cal_para_odb_m(save_result);
+save_his_del = HIS_D_G(1:T_NOW);
+
+path_matlab = pwd();
+save(name_data);
+fprintf('-----------------------------CMA-ES 结束！共计完成%d代！--------------------------\n', T_NOW);
+toc(time_all)
+
+Result_plot(save_sketch, save_result, save_his_del, BEST_D_G, BEST_NUM);
+
+if 1==1
+    abaqus_odb_open(path_abaqus, BEST_NUM(1), BEST_NUM(2));
+end

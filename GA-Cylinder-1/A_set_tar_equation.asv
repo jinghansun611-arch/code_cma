@@ -1,0 +1,90 @@
+function A_set_tar_equation
+global GA FEA tar
+
+% ===== 修正版 N3R：适合中点反对称条带、且不穿圆柱 =====
+syms t real
+
+GA.ORDER = 'N3R2';
+GA.Structure = '-midAntiSymSafe';
+
+n = 101;
+r_simu = 50;
+r = r_simu;
+TYPE = 5;
+
+% ---------------- FEA 参数 ----------------
+FEA.load_disturb   = 5e-7;
+FEA.load_pressall  = 1e-6;
+FEA.load_pressbond = 5e-5;
+FEA.mesh = [0.5; 0.5];
+FEA.cpus = 2;
+FEA.multitask = 16;
+FEA.P1_AZ = r + 0.1;
+FEA.P2_AZ = 0.2;
+
+% ---------------- 几何主参数 ----------------
+x  = 52;     % 轴向长度
+h0 = 18;     % 中部抬升幅值
+
+t_lim = [0, 1];
+u = 2*t - 1;     % 中心变量，u ∈ [-1,1]
+
+% h(u)：偶函数，且 >= 0，保证不进入圆柱内部
+h = h0 * (1 - u^2) * (0.82 + 0.18*cos(2*pi*u));
+
+% phi(u)：奇函数，保证俯视关于中点中心对称
+% 这版保留“变幅值正弦”风格，同时端点仍在圆柱外表附近
+phi = 0.09*pi*u ...
+    + 0.055*pi*sin(pi*u) ...
+    - 0.030*pi*sin(3*pi*u);
+
+% 半径始终 >= r
+funr = r + h;
+
+funx = x * t;
+funy = funr * sin(phi);
+funz = funr * cos(phi) - r;
+
+LINE = size(funx,1);
+
+% ---------------- 定位/交点/键合 ----------------
+% 中点对齐最合适
+%location = [1, 0.5, 0.49, 0.51, 0, 0];
+location = [1, 0.5, 0, 1, 0, 0];
+cross = zeros(0,8);
+bond = [2];
+tar.symmetry = [1,1,11];
+
+% ---------------- 开关 ----------------
+JUDGE = zeros(TYPE, LINE);
+JUDGE(1,:) = 1;   % TYPE1 宽度分布
+JUDGE(2,:) = 1;   % 第一轮建议先关 TYPE2
+JUDGE(4,1) = 1;   % TYPE4 lambda_x
+JUDGE(5,1) = 1;   % TYPE5 主动预扭转
+
+% ---------------- 变量范围 ----------------
+range(1,:) = [0.5, 1.5];
+range(2,:) = [-pi/2, pi];   % 若后续开 TYPE2，用收窄版
+range(3,:) = [-pi/36, pi/18];
+range(4,:) = [1.00, 1];
+range(5,:) = [-pi/4, pi/2];
+
+% ---------------- 写入 tar ----------------
+tar.r = r_simu;
+tar.r_simu = r_simu;
+
+tar.n = n;
+tar.t_lim = t_lim;
+tar.location = location;
+tar.cross = cross;
+tar.bond = bond;
+tar.funr = funr;
+tar.funx = funx;
+tar.funy = funy;
+tar.funz = funz;
+tar.line = LINE;
+tar.range = range;
+tar.judge_type_line = JUDGE;
+GA.TYPE = TYPE;
+
+end
